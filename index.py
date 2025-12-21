@@ -6,7 +6,7 @@ import sqlite3
 import pytz
 
 # Токен вашего бота
-TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+TOKEN = "8364305489:AAGaNNx1lc77a43Z41QGCXXfLxOi1OeVQy4"
 
 # Состояния для ConversationHandler
 SELECT_SERVICE, SELECT_DATE, SELECT_TIME, ENTER_NAME, CONFIRMATION = range(5)
@@ -314,8 +314,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /admin - административные функции (если вы админ)
 
 📞 **Контакты:**
-Для срочных вопросов: +7 (XXX) XXX-XX-XX
-Email: example@domain.com
+Для срочных вопросов: +7 952 448 3814
     """
     await update.message.reply_text(help_text)
 
