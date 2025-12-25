@@ -4,12 +4,17 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardR
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import sqlite3
 import pytz
+from aiogram import Bot, dispatcher
+from aiogram.types import message
+from aiogram.filters import COMMAND
 
 # Токен вашего бота
 TOKEN = "8364305489:AAGaNNx1lc77a43Z41QGCXXfLxOi1OeVQy4"
 
 # Состояния для ConversationHandler
 SELECT_SERVICE, SELECT_DATE, SELECT_TIME, ENTER_NAME, CONFIRMATION = range(5)
+
+dp = dispatcher
 
 # Включаем логирование
 logging.basicConfig(level=logging.INFO)
