@@ -6,7 +6,6 @@ import sqlite3
 import pytz
 from aiogram import Bot, dispatcher
 from aiogram.types import message
-from aiogram.filters import COMMAND
 
 # Токен вашего бота
 TOKEN = "8364305489:AAGaNNx1lc77a43Z41QGCXXfLxOi1OeVQy4"
