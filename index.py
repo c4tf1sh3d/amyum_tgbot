@@ -156,7 +156,7 @@ async def select_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Создаем кнопки с временем
     keyboard = []
-    times = ["09:00", "10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
+    times = ["10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
     
     for i in range(0, len(times), 3):
         row = []
