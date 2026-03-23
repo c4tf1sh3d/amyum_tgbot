@@ -5,6 +5,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import sqlite3
 import pytz
 from config import BOT_TOKEN as TOKEN
+from admin_panel import admin_menu, process_admin_query, is_admin
+from telegram.ext import CallbackQueryHandler
 
 
 # Состояния для ConversationHandler
@@ -73,7 +75,20 @@ def init_db():
     conn.close()
     print("База данных инициализирована")
 
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [KeyboardButton("📅 Записаться на сеанс")],
+        [KeyboardButton("📋 Мои записи"), KeyboardButton("ℹ️ Помощь")]
+    ]
+    # Если пишет админ — добавляем кнопку админки
+    if is_admin(update.effective_user.id):
+        keyboard.append([KeyboardButton("🛠 Админ-панель")])
+        
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "👋 Добро пожаловать! Выберите действие:",
+        reply_markup=reply_markup
+    )
 # ────────────────────────────────────────────────
 #  Вспомогательная функция — свободные слоты с учётом длительности
 # ────────────────────────────────────────────────
@@ -125,12 +140,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("📋 Мои записи"), KeyboardButton("ℹ️ Помощь")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(
+    await update.message.reply_text( # type: ignore
         "👋 Добро пожаловать! Я помогу вам записаться на сеанс.\n"
         "Выберите действие:",
         reply_markup=reply_markup
     )
 
+def main():
+    init_db()
+    application = Application.builder().token(TOKEN).build()
+
+    # Состояния ConversationHandler (оставляем как у вас)
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📅 Записаться на сеанс$"), start_booking)],
+        states={
+            SELECT_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_service)],
+            SELECT_DATE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, select_date)],
+            SELECT_TIME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, select_time)],
+            ENTER_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
+            CONFIRMATION:   [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_booking)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
 
 async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect('bookings.db')
@@ -151,10 +183,10 @@ async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = update.message.text.strip() # type: ignore
 
     if text == "❌ Отмена":
-        await update.message.reply_text("Запись отменена.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Запись отменена.", reply_markup=ReplyKeyboardRemove()) # type: ignore
         return ConversationHandler.END
 
     for sid, name, dur, price in context.user_data.get('services', []):
@@ -404,6 +436,14 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^📋 Мои записи$"), view_bookings))
     application.add_handler(MessageHandler(filters.Regex("^ℹ️ Помощь$"), help_command))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_menu)) # Команда /admin
+    application.add_handler(MessageHandler(filters.Regex("^🛠 Админ-панель$"), admin_menu)) # Кнопка
+    application.add_handler(CallbackQueryHandler(process_admin_query)) # Обработка кнопок админки
+    
+    application.add_handler(conv_handler)
+    application.add_handler(MessageHandler(filters.Regex("^📋 Мои записи$"), view_bookings))
+    application.add_handler(MessageHandler(filters.Regex("^ℹ️ Помощь$"), help_command))
 
     print("Бот запущен. Нажмите Ctrl+C для остановки")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
