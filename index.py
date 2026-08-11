@@ -1,6 +1,8 @@
 import logging
 import sqlite3
 import pytz
+import secrets
+import string
 from datetime import datetime, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -11,10 +13,10 @@ from telegram.ext import (
 
 # Импорты из ваших файлов
 from config import BOT_TOKEN as TOKEN, ADMIN_ID
-from admin_panel import admin_menu, process_admin_query, is_admin, notify_admin_new_booking
+from admin_panel import admin_menu, process_admin_query, is_admin, notify_admin_new_booking, handle_admin_text
 
 # Состояния
-SELECT_SERVICE, SELECT_DATE, SELECT_TIME, ENTER_NAME, CONFIRMATION = range(5)
+SELECT_SERVICE, SELECT_DATE, SELECT_TIME, ENTER_NAME, ENTER_PHONE, CONFIRMATION = range(6)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -39,9 +41,18 @@ def init_db():
             duration INTEGER, price INTEGER
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS clients (
+            user_id INTEGER PRIMARY KEY,
+            token TEXT UNIQUE,
+            phone TEXT,
+            first_name TEXT,
+            created_at TEXT
+        )
+    ''')
     cursor.execute("PRAGMA table_info(bookings)")
     columns = {col[1] for col in cursor.fetchall()}
-    for col in ['duration', 'photo_file_id', 'review_text', 'review_photo']:
+    for col in ['duration', 'photo_file_id', 'review_text', 'review_photo', 'phone', 'client_token', 'review_requested']:
         if col not in columns:
             cursor.execute(f"ALTER TABLE bookings ADD COLUMN {col} TEXT")
 
@@ -72,6 +83,41 @@ def get_available_times(date_str: str, duration: int) -> list[str]:
         if not any(max(s_min, to_min(bt)) < min(e_min, to_min(bt) + (bd or 60)) for bt, bd in booked):
             available.append(t)
     return available
+
+def generate_token() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "CL-" + "".join(secrets.choice(alphabet) for _ in range(6))
+
+def get_or_create_client(user_id: int, phone: str, name: str) -> str:
+    """Находит клиента по user_id или создаёт нового с уникальным токеном-идентификатором."""
+    conn = sqlite3.connect('bookings.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT token FROM clients WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if row:
+        token = row[0]
+        cursor.execute("UPDATE clients SET phone = ?, first_name = ? WHERE user_id = ?", (phone, name, user_id))
+        conn.commit()
+    else:
+        while True:
+            token = generate_token()
+            try:
+                cursor.execute(
+                    "INSERT INTO clients (user_id, token, phone, first_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, token, phone, name, datetime.now(MOSCOW_TZ).isoformat())
+                )
+                conn.commit()
+                break
+            except sqlite3.IntegrityError:
+                continue
+    conn.close()
+    return token
+
+def parse_booking_datetime(date_str: str, time_str: str) -> datetime:
+    """'12.08.2026 (Wednesday)' + '14:00' -> aware datetime в Europe/Moscow."""
+    clean_date = date_str.split(" (")[0]
+    naive = datetime.strptime(f"{clean_date} {time_str}", "%d.%m.%Y %H:%M")
+    return MOSCOW_TZ.localize(naive)
 
 # --- ОБРАБОТЧИКИ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -127,9 +173,35 @@ async def select_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ENTER_NAME
 
 async def enter_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ Отмена": return await cancel(update, context)
     context.user_data['client_name'] = update.message.text
+    kb = [
+        [KeyboardButton("📱 Отправить номер телефона", request_contact=True)],
+        [KeyboardButton("❌ Отмена")]
+    ]
+    await update.message.reply_text(
+        "Отправьте номер телефона кнопкой ниже или введите его вручную (например, +79991234567):",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
+    return ENTER_PHONE
+
+async def enter_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.contact:
+        phone = update.message.contact.phone_number
+    else:
+        if update.message.text == "❌ Отмена": return await cancel(update, context)
+        phone = update.message.text.strip()
+        # Простая проверка: только цифры, +, -, пробелы и скобки, минимум 10 цифр
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if len(digits) < 10:
+            await update.message.reply_text("Похоже, номер введён некорректно. Попробуйте ещё раз или нажмите кнопку отправки номера.")
+            return ENTER_PHONE
+
+    context.user_data['client_phone'] = phone
     s = context.user_data['selected_service']
-    msg = f"Проверьте:\nИмя: {update.message.text}\nУслуга: {s['name']}\nДата: {context.user_data['selected_date']} {context.user_data['selected_time']}"
+    msg = (f"Проверьте:\nИмя: {context.user_data['client_name']}\n"
+           f"Телефон: {phone}\nУслуга: {s['name']}\n"
+           f"Дата: {context.user_data['selected_date']} {context.user_data['selected_time']}")
     kb = [[KeyboardButton("✅ Подтвердить"), KeyboardButton("❌ Отменить")]]
     await update.message.reply_text(msg, reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return CONFIRMATION
@@ -139,19 +211,29 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     s = context.user_data['selected_service']
     d_str, t_str = context.user_data['selected_date'], context.user_data['selected_time']
-    
+    phone = context.user_data.get('client_phone')
+    name = context.user_data['client_name']
+
+    token = get_or_create_client(update.effective_user.id, phone, name)
+
     conn = sqlite3.connect('bookings.db')
     cursor = conn.cursor()
-    cursor.execute('''INSERT INTO bookings (user_id, username, first_name, service, booking_date, booking_time, duration, created_at)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
-                   (update.effective_user.id, update.effective_user.username, context.user_data['client_name'], 
-                    s['name'], d_str, t_str, s['duration'], datetime.now(MOSCOW_TZ).isoformat()))
+    cursor.execute('''INSERT INTO bookings (user_id, username, first_name, service, booking_date, booking_time, duration, created_at, phone, client_token)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                   (update.effective_user.id, update.effective_user.username, name, 
+                    s['name'], d_str, t_str, s['duration'], datetime.now(MOSCOW_TZ).isoformat(),
+                    phone, token))
     conn.commit()
     bid = cursor.lastrowid
     conn.close()
 
-    await notify_admin_new_booking(context, {'id': bid, 'name': context.user_data['client_name'], 'service': s['name'], 'date': d_str, 'time': t_str, 'username': update.effective_user.username})
-    await update.message.reply_text(f"✅ Запись №{bid} создана!", reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📅 Записаться на сеанс")]], resize_keyboard=True))
+    schedule_review_job(context.application, bid, d_str, t_str)
+
+    await notify_admin_new_booking(context, {'id': bid, 'name': name, 'service': s['name'], 'date': d_str, 'time': t_str, 'username': update.effective_user.username, 'phone': phone, 'token': token})
+    await update.message.reply_text(
+        f"✅ Запись №{bid} создана!\n🪪 Ваш ID клиента: {token} (пригодится, если будете обращаться к нам повторно)",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📅 Записаться на сеанс")]], resize_keyboard=True)
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -188,6 +270,61 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
+async def ask_for_review_job(context: ContextTypes.DEFAULT_TYPE):
+    """Срабатывает через 24ч после времени записи: просит клиента оценить качество обслуживания."""
+    bid = context.job.data['bid']
+    conn = sqlite3.connect('bookings.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT status, user_id, service, photo_file_id, review_requested FROM bookings WHERE id = ?", (bid,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return
+    status, u_id, s_name, a_photo, review_requested = row
+    # Отменённые записи и уже запрошенные отзывы не трогаем
+    if status == 'cancelled' or review_requested:
+        conn.close()
+        return
+    cursor.execute("UPDATE bookings SET status = 'completed', review_requested = '1' WHERE id = ?", (bid,))
+    conn.commit()
+    conn.close()
+
+    feedback_msg = (f"✨ Прошли сутки после записи «{s_name}». "
+                     f"Пожалуйста, оцените качество обслуживания — оставьте отзыв или пришлите фото результата.")
+    try:
+        if a_photo:
+            await context.bot.send_photo(chat_id=u_id, photo=a_photo, caption=feedback_msg)
+        else:
+            await context.bot.send_message(chat_id=u_id, text=feedback_msg)
+        context.application.user_data[u_id] = {'awaiting_review_bid': bid}
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(ADMIN_ID, f"ℹ️ По №{bid} автоматически запрошен отзыв (прошло 24ч с визита).")
+    except Exception:
+        pass
+
+def schedule_review_job(app: Application, bid: int, date_str: str, time_str: str):
+    try:
+        appt_dt = parse_booking_datetime(date_str, time_str)
+    except ValueError:
+        return
+    run_at = appt_dt + timedelta(hours=24)
+    app.job_queue.run_once(ask_for_review_job, when=run_at, data={'bid': bid}, name=f"review_{bid}")
+
+def schedule_pending_reviews(app: Application):
+    """Восстанавливает отложенные напоминания после перезапуска бота."""
+    conn = sqlite3.connect('bookings.db')
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, booking_date, booking_time FROM bookings
+        WHERE status != 'cancelled' AND (review_requested IS NULL OR review_requested = '')
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    for bid, d_str, t_str in rows:
+        schedule_review_job(app, bid, d_str, t_str)
+
 # --- ЗАПУСК ---
 def main():
     init_db()
@@ -200,6 +337,7 @@ def main():
             SELECT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_date)],
             SELECT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_time)],
             ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
+            ENTER_PHONE: [MessageHandler((filters.TEXT | filters.CONTACT) & ~filters.COMMAND, enter_phone)],
             CONFIRMATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_booking)]
         },
         fallbacks=[CommandHandler("cancel", cancel)]
@@ -210,9 +348,12 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^🛠 Админ-панель$"), admin_menu))
     app.add_handler(CallbackQueryHandler(process_admin_query))
     app.add_handler(MessageHandler(filters.PHOTO & filters.Chat(ADMIN_ID), handle_admin_photo))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Chat(ADMIN_ID) & ~filters.COMMAND, handle_admin_text), group=-1)
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_customer_review), group=-1)
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.Regex("^📋 Мои записи$"), view_bookings))
+
+    schedule_pending_reviews(app)
 
     print("Бот запущен...")
     app.run_polling()
